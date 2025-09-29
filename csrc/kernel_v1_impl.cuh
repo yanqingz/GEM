@@ -29,10 +29,41 @@ __device__ void simulate_block_v1(
   u32 *__restrict__ sram_data,
   u32 *__restrict__ shared_metadata,
   u32 *__restrict__ shared_writeouts,
-  u32 *__restrict__ shared_state
+  u32 *__restrict__ shared_state,
+  u32 *__restrict__ shared_prev_input,
+  u32 *__restrict__ shared_input_changed
   )
 {
+  // Declare variables that might be bypassed by goto
+  u32 sram_duplicate_t = 0;
+  u32 *ram = nullptr;
+  u32 r, w0;
+  u32 port_w_addr_iv, port_w_wr_en, port_w_wr_data_iv;
+  u32 clken_perm = 0;
+  u32 writeout_inv = 0;
+  
   int script_pi = 0;
+  
+  // Define macros for clock enable computation (needed for data gating)
+#define GEMV1_SHUF_CLKEN_K(k_outer, k_inner, t_shuffle) { \
+    u32 k = k_outer * 4 + k_inner;                      \
+    u32 t_shuffle_1_idx = t_shuffle & ((1 << 16) - 1);  \
+    u32 t_shuffle_2_idx = t_shuffle >> 16;              \
+                                                          \
+    clken_perm |=                                       \
+      (shared_writeouts[t_shuffle_1_idx >> 5] >>        \
+       (t_shuffle_1_idx & 31) & 1) << (k * 2);          \
+    clken_perm |=                                       \
+      (shared_writeouts[t_shuffle_2_idx >> 5] >>        \
+       (t_shuffle_2_idx & 31) & 1) << (k * 2 + 1);      \
+  }
+#define GEMV1_SHUF_CLKEN_K_4(k_outer, t_shuffle) {  \
+    GEMV1_SHUF_CLKEN_K(k_outer, 0, t_shuffle.c1); \
+    GEMV1_SHUF_CLKEN_K(k_outer, 1, t_shuffle.c2); \
+    GEMV1_SHUF_CLKEN_K(k_outer, 2, t_shuffle.c3); \
+    GEMV1_SHUF_CLKEN_K(k_outer, 3, t_shuffle.c4); \
+  }
+  
   while(true) {
     VectorRead2 t2_1, t2_2;
     VectorRead4 t4_1, t4_2, t4_3, t4_4, t4_5;
@@ -104,6 +135,30 @@ __device__ void simulate_block_v1(
     shared_state[threadIdx.x] = t_global_rd_state;
     __syncthreads();
 
+    // Data gating: Check if inputs have changed since last cycle
+    u32 current_input = shared_state[threadIdx.x];
+    u32 prev_input = shared_prev_input[threadIdx.x];
+    u32 input_changed = current_input ^ prev_input;
+    
+    // Store current input as previous for next cycle
+    shared_prev_input[threadIdx.x] = current_input;
+    
+
+    // Data gating: Check if any inputs changed for this partition
+    // Clear the shared flag at the beginning
+    if (threadIdx.x == 0) {
+      shared_input_changed[0] = 0;
+    }
+    __syncthreads();
+    
+    // Each thread atomically ORs its input_changed value to the shared flag
+    atomicOr(&shared_input_changed[0], input_changed);
+    __syncthreads();
+    
+    // All threads read the result
+    bool any_input_changed = shared_input_changed[0] != 0;
+
+  if(any_input_changed) {
     for(int bs_i = 0; bs_i < num_stages; ++bs_i) {
       u32 hier_input = 0, hier_flag_xora = 0, hier_flag_xorb = 0, hier_flag_orb = 0;
 #define GEMV1_SHUF_INPUT_K(k_outer, k_inner, t_shuffle) {           \
@@ -188,14 +243,22 @@ __device__ void simulate_block_v1(
       __syncthreads();
 
       // write out
-      if((writeout_hook_i >> 8) == bs_i) {
+      if(((writeout_hook_i >> 8) == bs_i)) {
         shared_writeouts[threadIdx.x] = shared_state[writeout_hook_i & 255];
       }
     }
+  } else {
+      script_pi += 256 * 4 * 5 * num_stages;
+      t4_1.read(((const VectorRead4 *)(script + script_pi)) + threadIdx.x);
+      t4_2.read(((const VectorRead4 *)(script + script_pi + 256 * 4)) + threadIdx.x);
+      t4_3.read(((const VectorRead4 *)(script + script_pi + 256 * 4 * 2)) + threadIdx.x);
+      t4_4.read(((const VectorRead4 *)(script + script_pi + 256 * 4 * 3)) + threadIdx.x);
+      t4_5.read(((const VectorRead4 *)(script + script_pi + 256 * 4 * 4)) + threadIdx.x);
+  }
     __syncthreads();
 
     // sram & duplicate permutation
-    u32 sram_duplicate_t = 0;
+    sram_duplicate_t = 0;
 #define GEMV1_SHUF_SRAM_DUPL_K(k_outer, k_inner, t_shuffle) { \
       u32 k = k_outer * 4 + k_inner;                          \
       u32 t_shuffle_1_idx = t_shuffle & ((1 << 16) - 1);      \
@@ -229,9 +292,6 @@ __device__ void simulate_block_v1(
     t4_5.read(((const VectorRead4 *)(script + script_pi + 256 * 4 * 4)) + threadIdx.x);
 
     // sram read fires here.
-    u32 *ram = nullptr;
-    u32 r, w0;
-    u32 port_w_addr_iv, port_w_wr_en, port_w_wr_data_iv;
     if(threadIdx.x < num_srams * 4) {
       u32 addrs = sram_duplicate_t;
       u32 last_tid = 32 + threadIdx.x / 32 * 32;
@@ -255,32 +315,12 @@ __device__ void simulate_block_v1(
     // __syncthreads();
 
     // clock enable permutation
-    u32 clken_perm = 0;
-#define GEMV1_SHUF_CLKEN_K(k_outer, k_inner, t_shuffle) { \
-      u32 k = k_outer * 4 + k_inner;                      \
-      u32 t_shuffle_1_idx = t_shuffle & ((1 << 16) - 1);  \
-      u32 t_shuffle_2_idx = t_shuffle >> 16;              \
-                                                          \
-      clken_perm |=                                       \
-        (shared_writeouts[t_shuffle_1_idx >> 5] >>        \
-         (t_shuffle_1_idx & 31) & 1) << (k * 2);          \
-      clken_perm |=                                       \
-        (shared_writeouts[t_shuffle_2_idx >> 5] >>        \
-         (t_shuffle_2_idx & 31) & 1) << (k * 2 + 1);      \
-    }
-#define GEMV1_SHUF_CLKEN_K_4(k_outer, t_shuffle) {  \
-      GEMV1_SHUF_CLKEN_K(k_outer, 0, t_shuffle.c1); \
-      GEMV1_SHUF_CLKEN_K(k_outer, 1, t_shuffle.c2); \
-      GEMV1_SHUF_CLKEN_K(k_outer, 2, t_shuffle.c3); \
-      GEMV1_SHUF_CLKEN_K(k_outer, 3, t_shuffle.c4); \
-    }
+    clken_perm = 0;
     script_pi += 256 * 4 * 5;
     GEMV1_SHUF_CLKEN_K_4(0, t4_1);
     GEMV1_SHUF_CLKEN_K_4(1, t4_2);
     GEMV1_SHUF_CLKEN_K_4(2, t4_3);
     GEMV1_SHUF_CLKEN_K_4(3, t4_4);
-#undef GEMV1_SHUF_CLKEN_K
-#undef GEMV1_SHUF_CLKEN_K_4
 
     // sram commit
     if(threadIdx.x < num_srams * 4) {
@@ -295,7 +335,9 @@ __device__ void simulate_block_v1(
     }
 
     __syncthreads();
-    u32 writeout_inv = shared_writeouts[threadIdx.x];
+    writeout_inv = shared_writeouts[threadIdx.x];
+
+        // Writeouts writing section (used by both gated and non-gated paths)
 
     clken_perm = (clken_perm & ~t4_5.c2) ^ t4_5.c1;
     writeout_inv ^= t4_5.c3;
@@ -327,6 +369,8 @@ __global__ void simulate_v1_noninteractive_simple_scan(
   __shared__ u32 shared_metadata[256];
   __shared__ u32 shared_writeouts[256];
   __shared__ u32 shared_state[256];
+  __shared__ u32 shared_prev_input[256];     // Previous cycle input for data gating
+  __shared__ u32 shared_input_changed[1];    // Change flag for data gating
   __shared__ u32 script_starts[32], script_sizes[32];
   assert(num_major_stages <= 32);
   if(threadIdx.x < num_major_stages) {
@@ -334,6 +378,16 @@ __global__ void simulate_v1_noninteractive_simple_scan(
     script_sizes[threadIdx.x] = blocks_start[threadIdx.x * num_blocks + blockIdx.x + 1] - script_starts[threadIdx.x];
   }
   __syncthreads();
+  
+  // Initialize data gating shared memory
+  if(threadIdx.x < 256) {
+    shared_prev_input[threadIdx.x] = 0;  // Initialize previous input to 0
+  }
+  if(threadIdx.x == 0) {
+    shared_input_changed[0] = 0;  // Initialize change flag to 0
+  }
+  __syncthreads();
+  
   for(usize cycle_i = 0; cycle_i < num_cycles; ++cycle_i) {
     for(usize stage_i = 0; stage_i < num_major_stages; ++stage_i) {
       simulate_block_v1(
@@ -342,7 +396,8 @@ __global__ void simulate_v1_noninteractive_simple_scan(
         states_noninteractive + cycle_i * state_size,
         states_noninteractive + (cycle_i + 1) * state_size,
         sram_data,
-        shared_metadata, shared_writeouts, shared_state
+        shared_metadata, shared_writeouts, shared_state,
+        shared_prev_input, shared_input_changed
         );
       cooperative_groups::this_grid().sync();
     }
