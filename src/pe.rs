@@ -18,6 +18,9 @@ pub const BOOMERANG_NUM_STAGES: usize = 13;
 
 const BOOMERANG_MAX_WRITEOUTS: usize = 1 << (BOOMERANG_NUM_STAGES - 5);
 
+// Global constant for maximum number of partitions before using relaxed merging criteria
+const TOO_MANY_PARTITIONS2: usize = 1000;
+
 /// One Boomerang stage
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoomerangStage {
@@ -587,14 +590,18 @@ pub fn process_partitions(
         order.len()
     }).collect::<Vec<_>>();
 
-    let all_original_parts = parts.par_iter().enumerate().map(|(i, v)| {
-        let part = Partition::build_one(aig, staged, v);
-        if part.is_none() {
-            clilog::error!("Partition {} exceeds resource constraint.", i);
-        }
-        part
-    }).collect::<Vec<_>>();
+    let all_original_parts = {
+        clilog::info!("Building original partitions in parallel");
+        parts.par_iter().enumerate().map(|(i, v)| {
+            let part = Partition::build_one(aig, staged, v);
+            if part.is_none() {
+                clilog::error!("Partition {} exceeds resource constraint.", i);
+            }
+            part
+        }).collect::<Vec<_>>()
+    };
     let all_original_parts = all_original_parts.into_iter().collect::<Option<Vec<_>>>()?;
+    clilog::info!("Building original partitions completed");
     let max_original_nstages = all_original_parts.iter()
         .map(|p| p.stages.len()).max().unwrap();
 
@@ -678,6 +685,357 @@ pub fn process_partitions(
                                         {} > {}", i, j, partition.stages.len(),
                                        max_original_nstages + max_stage_degrad);
                         merge_blacklist.insert(j);
+                    }
+                    Some(partition) => {
+                        clilog::info!("merged partition {} with {}", i, j);
+                        parts[i] = parts_ij;
+                        parts[j] = vec![];
+                        partition_self = partition;
+                        merged = true;
+                        cnt_node_i = cnt_new;
+                        break
+                    },
+                }
+            }
+            if !merged { break }
+        }
+
+        clilog::info!("part {}: #stages {}",
+                      i, partition_self.stages.len());
+        effective_parts.push(partition_self);
+    }
+    effective_parts.sort_by_key(|p| usize::MAX - p.stages.len());
+    Some(effective_parts)
+}
+
+/// Conditional version of process_partitions that uses relaxed merging criteria
+/// when there are too many partitions or high stage variance
+pub fn process_partitions_conditional(
+    aig: &AIG,
+    staged: &StagedAIG,
+    mut parts: Vec<Vec<usize>>,
+    max_stage_degrad: usize,
+) -> Option<Vec<Partition>> {
+    let cnt_nodes = parts.par_iter().map(|v| {
+        let mut comb_outputs = Vec::new();
+        for &endpt_i in v {
+            staged.get_endpoint_group(aig, endpt_i).for_each_input(|i| {
+                comb_outputs.push(i);
+            });
+        }
+        let order = aig.topo_traverse_generic(
+            Some(&comb_outputs),
+            staged.primary_inputs.as_ref(),
+        );
+        order.len()
+    }).collect::<Vec<_>>();
+
+    let all_original_parts = {
+        clilog::info!("Building original partitions in parallel");
+        parts.par_iter().enumerate().map(|(i, v)| {
+            let part = Partition::build_one(aig, staged, v);
+            if part.is_none() {
+                clilog::error!("Partition {} exceeds resource constraint.", i);
+            }
+            part
+        }).collect::<Vec<_>>()
+    };
+    let all_original_parts = all_original_parts.into_iter().collect::<Option<Vec<_>>>()?;
+    clilog::info!("Building original partitions completed");
+    
+    // Calculate stage statistics
+    let max_original_nstages = all_original_parts.iter()
+        .map(|p| p.stages.len()).max().unwrap();
+    let min_original_nstages = all_original_parts.iter()
+        .map(|p| p.stages.len()).min().unwrap();
+    let stage_range = max_original_nstages - min_original_nstages;
+    let num_partitions = all_original_parts.len();
+    
+    clilog::info!("Stage statistics: max={}, min={}, range={}, num_partitions={}", 
+                  max_original_nstages, min_original_nstages, stage_range, num_partitions);
+    
+    // Determine if we should use relaxed merging criteria
+    let use_relaxed_criteria = stage_range > 1 || num_partitions > TOO_MANY_PARTITIONS2;
+    let effective_max_stage_degrad = if use_relaxed_criteria {
+        max_stage_degrad + 1
+    } else {
+        max_stage_degrad
+    };
+    
+    if use_relaxed_criteria {
+        clilog::info!("Using relaxed merging criteria (max_stage_degrad: {} -> {})", 
+                      max_stage_degrad, effective_max_stage_degrad);
+    }
+
+    let mut effective_parts = Vec::<Partition>::new();
+    let max_trials = (all_original_parts.len() / 8).max(20);
+    for (i, mut partition_self) in all_original_parts.into_iter().enumerate() {
+        if parts[i].is_empty() {
+            continue
+        }
+        let mut merge_blacklist = HashSet::<usize>::new();
+        let mut cnt_node_i = cnt_nodes[i];
+        loop {
+            let mut comb_outputs = Vec::new();
+            for &endpt_i in &parts[i] {
+                staged.get_endpoint_group(aig, endpt_i).for_each_input(|i| {
+                    comb_outputs.push(i);
+                });
+            }
+
+            let mut merge_choices = parts[i + 1..parts.len()].par_iter().enumerate().filter_map(|(j, v)| {
+                if v.is_empty() { return None }
+                if merge_blacklist.contains(&(i + j + 1)) {
+                    return None
+                }
+                let mut comb_outputs = comb_outputs.clone();
+                for &endpt_i in v {
+                    staged.get_endpoint_group(aig, endpt_i).for_each_input(|i| {
+                        comb_outputs.push(i);
+                    });
+                }
+                let order = aig.topo_traverse_generic(
+                    Some(&comb_outputs),
+                    staged.primary_inputs.as_ref(),
+                );
+                Some((order.len() - cnt_nodes[i + j + 1].max(cnt_node_i),
+                      order.len(),
+                      i + j + 1))
+            }).collect::<Vec<_>>();
+            merge_choices.sort();
+            let mut merged = false;
+
+            #[derive(Clone)]
+            struct PartsPartitions {
+                parts_ij: Vec<usize>,
+                partition_ij: Option<Partition>,
+            }
+            let mut merge_trials: Vec<Option<PartsPartitions>> =
+                vec![None; merge_choices.len()];
+            let mut parallel_trial_stride = 4;
+
+            for (merge_i, &(_cnt_diff, cnt_new, j)) in merge_choices.iter().enumerate() {
+                if merge_trials[merge_i].is_none() {
+                    if merge_i > max_trials {
+                        break   // do not try too more
+                    }
+                    let rhs = merge_trials.len().min(
+                        merge_i + parallel_trial_stride);
+                    merge_trials[merge_i..rhs].par_iter_mut().enumerate().for_each(|(merge_j, trial)| {
+                        let j = merge_choices[merge_i + merge_j].2;
+                        let parts_ij = parts[i].iter().chain(parts[j].iter()).copied().collect();
+                        let partition_ij = Partition::build_one(aig, staged, &parts_ij);
+                        *trial = Some(PartsPartitions {
+                            parts_ij, partition_ij
+                        });
+                    });
+                    parallel_trial_stride *= 2;
+                }
+
+                let PartsPartitions {
+                    parts_ij, partition_ij
+                } = merge_trials[merge_i].take().unwrap();
+
+                match partition_ij {
+                    None => {
+                        merge_blacklist.insert(j);
+                    }
+                    Some(partition) if partition.stages.len() >
+                        max_original_nstages + effective_max_stage_degrad =>
+                    {
+                        clilog::debug!("skipped merging {} with {} due to nstage degradation: \
+                                        {} > {}", i, j, partition.stages.len(),
+                                       max_original_nstages + effective_max_stage_degrad);
+                        merge_blacklist.insert(j);
+                    }
+                    Some(partition) => {
+                        clilog::info!("merged partition {} with {}", i, j);
+                        parts[i] = parts_ij;
+                        parts[j] = vec![];
+                        partition_self = partition;
+                        merged = true;
+                        cnt_node_i = cnt_new;
+                        break
+                    },
+                }
+            }
+            if !merged { break }
+        }
+
+        clilog::info!("part {}: #stages {}",
+                      i, partition_self.stages.len());
+        effective_parts.push(partition_self);
+    }
+    effective_parts.sort_by_key(|p| usize::MAX - p.stages.len());
+    Some(effective_parts)
+}
+
+/// Conditional version of process_partitions that uses relaxed merging criteria
+/// when there are too many partitions or high stage variance, with additional
+/// skip logic for partitions at max stage count
+pub fn process_partitions_conditional_skip(
+    aig: &AIG,
+    staged: &StagedAIG,
+    mut parts: Vec<Vec<usize>>,
+    max_stage_degrad: usize,
+) -> Option<Vec<Partition>> {
+    let cnt_nodes = parts.par_iter().map(|v| {
+        let mut comb_outputs = Vec::new();
+        for &endpt_i in v {
+            staged.get_endpoint_group(aig, endpt_i).for_each_input(|i| {
+                comb_outputs.push(i);
+            });
+        }
+        let order = aig.topo_traverse_generic(
+            Some(&comb_outputs),
+            staged.primary_inputs.as_ref(),
+        );
+        order.len()
+    }).collect::<Vec<_>>();
+
+    let all_original_parts = {
+        clilog::info!("Building original partitions in parallel");
+        parts.par_iter().enumerate().map(|(i, v)| {
+            let part = Partition::build_one(aig, staged, v);
+            if part.is_none() {
+                clilog::error!("Partition {} exceeds resource constraint.", i);
+            }
+            part
+        }).collect::<Vec<_>>()
+    };
+    let all_original_parts = all_original_parts.into_iter().collect::<Option<Vec<_>>>()?;
+    clilog::info!("Building original partitions completed");
+    
+    // Calculate stage statistics
+    let max_original_nstages = all_original_parts.iter()
+        .map(|p| p.stages.len()).max().unwrap();
+    let min_original_nstages = all_original_parts.iter()
+        .map(|p| p.stages.len()).min().unwrap();
+    let stage_range = max_original_nstages - min_original_nstages;
+    let num_partitions = all_original_parts.len();
+    
+    clilog::info!("Stage statistics: max={}, min={}, range={}, num_partitions={}", 
+                  max_original_nstages, min_original_nstages, stage_range, num_partitions);
+    
+    // Determine if we should use relaxed merging criteria
+    let use_relaxed_criteria = stage_range > 1 || num_partitions > TOO_MANY_PARTITIONS2;
+    let effective_max_stage_degrad = if use_relaxed_criteria {
+        max_stage_degrad + 1
+    } else {
+        max_stage_degrad
+    };
+    
+    if use_relaxed_criteria {
+        clilog::info!("Using relaxed merging criteria (max_stage_degrad: {} -> {})", 
+                      max_stage_degrad, effective_max_stage_degrad);
+    }
+
+    let mut effective_parts = Vec::<Partition>::new();
+    let max_trials = (all_original_parts.len() / 8).max(20);
+    for (i, mut partition_self) in all_original_parts.into_iter().enumerate() {
+        if parts[i].is_empty() {
+            continue
+        }
+        let mut merge_blacklist = HashSet::<usize>::new();
+        let mut cnt_node_i = cnt_nodes[i];
+        
+        // Store the initial stage count to determine if we should skip merging
+        let initial_stage_count = partition_self.stages.len();
+        
+        // Counter to track nstage degradation skips for this partition
+        let mut nstage_degradation_skips = 0;
+        
+        loop {
+            let mut comb_outputs = Vec::new();
+            for &endpt_i in &parts[i] {
+                staged.get_endpoint_group(aig, endpt_i).for_each_input(|i| {
+                    comb_outputs.push(i);
+                });
+            }
+
+            // New skip logic: if there are too many partitions and partition i STARTED at max stage count,
+            // skip merging the first partition (partition i) in the pair
+            if num_partitions > TOO_MANY_PARTITIONS2 && 
+               initial_stage_count == max_original_nstages {
+                clilog::debug!("skipped merging partition {} (started at max stage count {}) due to too many partitions ({})", 
+                              i, max_original_nstages, num_partitions);
+                // Skip the entire merge loop for this partition
+                break;
+            }
+
+            let mut merge_choices = parts[i + 1..parts.len()].par_iter().enumerate().filter_map(|(j, v)| {
+                if v.is_empty() { return None }
+                if merge_blacklist.contains(&(i + j + 1)) {
+                    return None
+                }
+                
+                let mut comb_outputs = comb_outputs.clone();
+                for &endpt_i in v {
+                    staged.get_endpoint_group(aig, endpt_i).for_each_input(|i| {
+                        comb_outputs.push(i);
+                    });
+                }
+                let order = aig.topo_traverse_generic(
+                    Some(&comb_outputs),
+                    staged.primary_inputs.as_ref(),
+                );
+                Some((order.len() - cnt_nodes[i + j + 1].max(cnt_node_i),
+                      order.len(),
+                      i + j + 1))
+            }).collect::<Vec<_>>();
+            merge_choices.sort();
+            let mut merged = false;
+
+            #[derive(Clone)]
+            struct PartsPartitions {
+                parts_ij: Vec<usize>,
+                partition_ij: Option<Partition>,
+            }
+            let mut merge_trials: Vec<Option<PartsPartitions>> =
+                vec![None; merge_choices.len()];
+            let mut parallel_trial_stride = 4;
+
+            for (merge_i, &(_cnt_diff, cnt_new, j)) in merge_choices.iter().enumerate() {
+                if merge_trials[merge_i].is_none() {
+                    if merge_i > max_trials {
+                        break   // do not try too more
+                    }
+                    let rhs = merge_trials.len().min(
+                        merge_i + parallel_trial_stride);
+                    merge_trials[merge_i..rhs].par_iter_mut().enumerate().for_each(|(merge_j, trial)| {
+                        let j = merge_choices[merge_i + merge_j].2;
+                        let parts_ij = parts[i].iter().chain(parts[j].iter()).copied().collect();
+                        let partition_ij = Partition::build_one(aig, staged, &parts_ij);
+                        *trial = Some(PartsPartitions {
+                            parts_ij, partition_ij
+                        });
+                    });
+                    parallel_trial_stride *= 2;
+                }
+
+                let PartsPartitions {
+                    parts_ij, partition_ij
+                } = merge_trials[merge_i].take().unwrap();
+
+                match partition_ij {
+                    None => {
+                        merge_blacklist.insert(j);
+                    }
+                    Some(partition) if partition.stages.len() >
+                        max_original_nstages + effective_max_stage_degrad =>
+                    {
+                        clilog::debug!("skipped merging {} with {} due to nstage degradation: \
+                                        {} > {}", i, j, partition.stages.len(),
+                                       max_original_nstages + effective_max_stage_degrad);
+                        merge_blacklist.insert(j);
+                        nstage_degradation_skips += 1;
+                        
+                        // If we've seen 5 nstage degradation skips, stop trying to merge this partition
+                        if nstage_degradation_skips >= 5 {
+                            clilog::debug!("stopping merge attempts for partition {} after {} nstage degradation skips", 
+                                          i, nstage_degradation_skips);
+                            break;
+                        }
                     }
                     Some(partition) => {
                         clilog::info!("merged partition {} with {}", i, j);

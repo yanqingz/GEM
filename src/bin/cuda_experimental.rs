@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 use std::path::PathBuf;
-use gem::aigpdk::{AIGPDKLeafPins, AIGPDK_SRAM_SIZE};
+use gem::aigpdk::AIGPDKLeafPins;
 use gem::aig::{DriverType, AIG};
 use gem::staging::build_staged_aigs;
 use gem::pe::Partition;
@@ -16,6 +16,7 @@ use std::hash::Hash;
 use std::rc::Rc;
 use std::collections::{HashMap, HashSet};
 use vcd_ng::{Parser, ScopeItem, Var, Scope, FastFlow, FastFlowToken, FFValueChange, Writer, SimulationCommand};
+
 
 #[derive(clap::Parser, Debug)]
 struct SimulatorArgs {
@@ -181,7 +182,7 @@ mod ucci {
 /// Write VCD output for a specific chunk
 fn write_vcd_chunk(
     writer: &mut Writer<BufWriter<File>>,
-    input_states_uvec: &UVec<u32>,
+    input_states: &[u32],
     offsets_timestamps: &[(usize, u64)],
     out2vcd: &[(usize, u32, vcd_ng::IdCode)],
     reg_io_state_size: usize,
@@ -212,11 +213,11 @@ fn write_vcd_chunk(
                     if (output_pos & (1u32 << 31)) != 0 {
                         // This is an input signal, read from input state at current timestamp
                         let input_pos = output_pos & !(1u32 << 31);
-                        let value_new_input = input_states_uvec[chunk_offset - reg_io_state_size + (input_pos >> 5) as usize] >> (input_pos & 31) & 1;
+                        let value_new_input = input_states[chunk_offset - reg_io_state_size + (input_pos >> 5) as usize] >> (input_pos & 31) & 1;
                         value_new_input
                     } else {
                         // This is an output signal, read from output state
-                        let value_new_output = input_states_uvec[chunk_offset + (output_pos >> 5) as usize] >> (output_pos & 31) & 1;
+                        let value_new_output = input_states[chunk_offset + (output_pos >> 5) as usize] >> (output_pos & 31) & 1;
                         value_new_output
                     }
                 },
@@ -631,25 +632,30 @@ fn main() {
         // Create chunk_offsets_timestamps by extracting the relevant portion
         let chunk_offsets_timestamps = offsets_timestamps[start_cycle..actual_end_cycle].to_vec();
         
-        // Transfer chunk data to GPU
+        // Store the length before moving chunk_input_states
+        let chunk_input_states_len = chunk_input_states.len();
+        
+        
+        // Transfer only the chunk data to GPU (not the entire input_states)
         let mut input_states_uvec: UVec<_> = chunk_input_states.into();
         input_states_uvec.as_mut_uptr(device);
         
+        
         // Run simulation for this chunk
-    device.synchronize();
+        device.synchronize();
         let timer_sim = clilog::stimer!("simulation_chunk");
-    ucci::simulate_v1_noninteractive_simple_scan(
-        args.num_blocks,
-        script.num_major_stages,
-        &script.blocks_start, &script.blocks_data,
-        &mut sram_storage,
+        ucci::simulate_v1_noninteractive_simple_scan(
+            args.num_blocks,
+            script.num_major_stages,
+            &script.blocks_start, &script.blocks_data,
+            &mut sram_storage,
             chunk_size,
-        script.reg_io_state_size as usize,
-        &mut input_states_uvec,
-        device
-    );
-    device.synchronize();
-    clilog::finish!(timer_sim);
+            script.reg_io_state_size as usize,
+            &mut input_states_uvec,
+            device
+        );
+        device.synchronize();
+        clilog::finish!(timer_sim);
 
         // Save final state from this chunk (for next chunk initialization)
         if chunk_idx < num_chunks - 1 {
@@ -664,9 +670,13 @@ fn main() {
             clilog::info!("Saved final state and SRAM state to CPU after chunk {}", chunk_idx + 1);
         }
         
+        // Copy results back from GPU to CPU for VCD writing
+        let mut chunk_results = vec![0u32; chunk_input_states_len];
+        chunk_results.copy_from_slice(&input_states_uvec);
+        
         // Write VCD output for this chunk
         clilog::info!("write out vcd");
-        write_vcd_chunk(&mut writer, &input_states_uvec, &chunk_offsets_timestamps, 
+        write_vcd_chunk(&mut writer, &chunk_results, &chunk_offsets_timestamps, 
                        &out2vcd, script.reg_io_state_size as usize, start_cycle);
         
         clilog::info!("Completed chunk {}/{}", chunk_idx + 1, num_chunks);
