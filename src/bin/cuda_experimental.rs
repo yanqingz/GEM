@@ -180,6 +180,61 @@ mod ucci {
 
 
 /// Write VCD output for a specific chunk
+fn write_vcd_chunk_gpu(
+    writer: &mut Writer<BufWriter<File>>,
+    input_states: &UVec<u32>,
+    offsets_timestamps: &[(usize, u64)],
+    out2vcd: &[(usize, u32, vcd_ng::IdCode)],
+    reg_io_state_size: usize,
+    chunk_start_cycle: usize
+) {
+    let mut last_val = vec![2; out2vcd.len()];
+    
+    for &(global_offset, timestamp) in offsets_timestamps {
+        if timestamp == u64::MAX {
+            continue
+        }
+        writer.timestamp(timestamp).unwrap();
+        
+        // Convert global offset to chunk-relative offset
+        // global_offset is the absolute position in the original input_states array
+        // We need to subtract the start offset to get the position within the chunk
+        let chunk_offset = global_offset - (chunk_start_cycle * reg_io_state_size);
+        
+        for (i, &(output_aigpin, output_pos, vid)) in out2vcd.iter().enumerate() {
+            use vcd_ng::Value;
+            let value_new = match output_pos {
+                u32::MAX => {
+                    assert!(output_aigpin <= 1);
+                    output_aigpin as u32
+                },
+                output_pos @ _ => {
+                    // Check if this is an input signal (high bit set)
+                    if (output_pos & (1u32 << 31)) != 0 {
+                        // This is an input signal, read from input state at current timestamp
+                        let input_pos = output_pos & !(1u32 << 31);
+                        let value_new_input = input_states[chunk_offset - reg_io_state_size + (input_pos >> 5) as usize] >> (input_pos & 31) & 1;
+                        value_new_input
+                    } else {
+                        // This is an output signal, read from output state
+                        let value_new_output = input_states[chunk_offset + (output_pos >> 5) as usize] >> (output_pos & 31) & 1;
+                        value_new_output
+                    }
+                },
+            };
+            
+            if value_new == last_val[i] {
+                continue
+            }
+            last_val[i] = value_new;
+            writer.change_scalar(vid, match value_new {
+                1 => Value::V1,
+                _ => Value::V0
+            }).unwrap();
+        }
+    }
+}
+
 fn write_vcd_chunk(
     writer: &mut Writer<BufWriter<File>>,
     input_states: &[u32],
@@ -670,14 +725,10 @@ fn main() {
             clilog::info!("Saved final state and SRAM state to CPU after chunk {}", chunk_idx + 1);
         }
         
-        // Copy results back from GPU to CPU for VCD writing
-        let mut chunk_results = vec![0u32; chunk_input_states_len];
-        chunk_results.copy_from_slice(&input_states_uvec);
-        
-        // Write VCD output for this chunk
+        // Write VCD output for this chunk directly from GPU data
         clilog::info!("write out vcd");
-        write_vcd_chunk(&mut writer, &chunk_results, &chunk_offsets_timestamps, 
-                       &out2vcd, script.reg_io_state_size as usize, start_cycle);
+        write_vcd_chunk_gpu(&mut writer, &input_states_uvec, &chunk_offsets_timestamps, 
+                           &out2vcd, script.reg_io_state_size as usize, start_cycle);
         
         clilog::info!("Completed chunk {}/{}", chunk_idx + 1, num_chunks);
     }
